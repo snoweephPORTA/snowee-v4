@@ -1,0 +1,22 @@
+{
+  "name": "Snowee Dashboard V4",
+  "short_name": "Snowee Dash",
+  "description": "Snowee POS Analytics Dashboard",
+  "start_url": "/snowee-v4/dashboard-v4.html",
+  "display": "standalone",
+  "background_color": "#1B3A6B",
+  "theme_color": "#1B3A6B",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://snoweephporta.github.io/snowee-v4/snowee-v4-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://snoweephporta.github.io/snowee-v4/snowee-v4-icon-192.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
