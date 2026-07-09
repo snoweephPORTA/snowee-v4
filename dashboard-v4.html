@@ -243,11 +243,6 @@ function fixDate(d){
   } catch(e) {}
   return s;
 }
-// time/timeCreated/timeDone columns come back anchored to the Sheets time-epoch
-// (e.g. "Sat Dec 30 1899 16:35:00 GMT+0800") because those Sheet columns are
-// formatted as TIME-only. The hour/minute portion still parses correctly —
-// only the *date* portion is bogus, so never use this for day-bucketing.
-// Always use row.date (a clean "YYYY-MM-DD" string) for that instead.
 function getHourFromRow(r){
   if(r.timeCreated){const d=new Date(r.timeCreated);if(!isNaN(d.getTime()))return d.getHours();}
   if(r.time){const d=new Date(r.time);if(!isNaN(d.getTime()))return d.getHours();}
@@ -264,11 +259,6 @@ let selectedDate=today();
 let currentTab='today';
 let itemFilter='today';
 
-/* ── TXN-ID reconciliation (locked-in rule) ──
-   Group every row by txnId. Old test rows (before TXN IDs existed) fall back
-   to date|queue so they don't collapse into one phantom order. order_total is
-   the single source of truth for an order's value — it's written identically
-   on every row of that order by the POS, matching what the POS itself shows. */
 function orderKey(r){
   const txn=String(r.txnId||'').trim();
   if(txn) return txn;
@@ -284,10 +274,18 @@ function getOrders(rows){
   });
   return Object.values(o);
 }
+// Uses the all-time lightweight summaries pushed from Apps Script (covers every
+// day since the beginning), falling back to computing from rawRows for any date
+// not covered by the JSON — e.g. today, which arrives live via Firebase before
+// the next scheduled JSON push includes it. This keeps History's all-time totals
+// intact even though rawRows itself only carries the last 30 days of detail.
 function dailySummary(){
+  const fromJson=(window._dailySummariesCache||[]).map(s=>({date:s.date,revenue:s.revenue,orders:s.orders,cash:s.cash,gcash:s.gcash}));
+  const jsonDates={};fromJson.forEach(s=>{jsonDates[s.date]=true;});
+
   const byDate={};
   rawRows.forEach(function(r){
-    const d=r.date; if(!d) return;
+    const d=r.date; if(!d||jsonDates[d]) return;
     if(!byDate[d]) byDate[d]={date:d,revenue:0,orders:0,cash:0,gcash:0,_seen:{}};
     const key=orderKey(r);
     if(!byDate[d]._seen[key]){
@@ -297,7 +295,7 @@ function dailySummary(){
       if((r.payment||'').toLowerCase()==='gcash') byDate[d].gcash+=tot; else byDate[d].cash+=tot;
     }
   });
-  return Object.values(byDate);
+  return fromJson.concat(Object.values(byDate));
 }
 function getItemsFromRows(rows,limit=20){
   const m={};
@@ -419,7 +417,18 @@ function orderLog(rows){
   }).join('')+'</div>';
 }
 function buildDayCard(rows,dateStr){
-  if(!rows.length)return`<div class="empty">📭 No orders for ${fmtDateLabel(dateStr)}</div>`;
+  if(!rows.length){
+    // Check if we have at least a summary total for this day (from the all-time
+    // dailySummaries JSON) even though no itemized rawRows exist for it (older
+    // than the 30-day detail window). Show the total with a note instead of
+    // claiming there's no data at all.
+    const DS=dailySummary();
+    const s=DS.find(d=>d.date===dateStr);
+    if(s){
+      return`<div class="card"><div class="big-stat"><div class="big-num">₱${fmt(s.revenue.toFixed(0))}</div><div class="big-lbl">Total Revenue</div></div><div class="stat-grid"><div class="stat-item"><div class="stat-num">${s.orders}</div><div class="stat-lbl">Orders</div></div><div class="stat-item"><div class="stat-num">₱${fmt((s.orders?s.revenue/s.orders:0).toFixed(0))}</div><div class="stat-lbl">Avg Order</div></div></div><div class="pay-row"><div class="pay-item"><div class="pay-num">₱${fmt(s.cash.toFixed(0))}</div><div class="pay-lbl">💵 Cash</div></div><div class="pay-item"><div class="pay-num" style="color:#007AFF">₱${fmt(s.gcash.toFixed(0))}</div><div class="pay-lbl">📱 GCash</div></div></div></div><div class="empty">📁 Detailed order log is only kept for the last 30 days.<br>This day's totals are shown above from the all-time summary.</div>`;
+    }
+    return`<div class="empty">📭 No orders for ${fmtDateLabel(dateStr)}</div>`;
+  }
   const orders=getOrders(rows);
   const rev=orders.reduce((s,o)=>s+o.total,0);
   const cashO=orders.filter(o=>(o.payment||'').toLowerCase()==='cash');
@@ -544,7 +553,6 @@ function renderInsights(){
   document.getElementById('insights-body').innerHTML=`<div class="card"><div class="card-hd"><span class="card-title">💡 Business Insights</span><span class="card-sub">Auto-generated</span></div><div>${insights.map(ins=>`<div class="insight-item"><div class="insight-icon">${ins.icon}</div><div class="insight-text"><div class="insight-title">${ins.title}</div><div class="insight-desc">${ins.desc}</div><span class="insight-badge ${ins.badge}">${ins.badgeText}</span></div></div>`).join('')}</div></div>`;
 }
 
-/* ── Floating Order Alerts (3-min / 5-min, from POS popups) ── */
 window._floatingAlerts = [];
 async function pollFloatingAlerts(){
   try{
@@ -639,7 +647,8 @@ async function loadData(){
     const json=await res.json();
     if(json.status==='ok'){
       rawRows=(json.rawRows||[]).map(r=>({...r,date:fixDate(r.date)}));
-      if(window._applyLiveRows) window._applyLiveRows(); // re-merge live Firebase data (JSON may not have it yet)
+      window._dailySummariesCache = json.dailySummaries || [];
+      if(window._applyLiveRows) window._applyLiveRows();
       document.getElementById('last-update').textContent='Updated '+new Date(json.updated).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
       document.getElementById('date-picker').value=selectedDate;
       renderCurrentTab();
@@ -653,7 +662,8 @@ setInterval(async function(){
     const json=await res.json();
     if(json.status==='ok'){
       rawRows=(json.rawRows||[]).map(r=>({...r,date:fixDate(r.date)}));
-      if(window._applyLiveRows) window._applyLiveRows(); // re-merge live Firebase data (JSON may not have it yet)
+      window._dailySummariesCache = json.dailySummaries || [];
+      if(window._applyLiveRows) window._applyLiveRows();
       document.getElementById('last-update').textContent='Updated '+new Date(json.updated).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
       if(currentTab!=='today')renderCurrentTab();
       else renderToday();
@@ -663,17 +673,12 @@ setInterval(async function(){
 
 let _soundOn = localStorage.getItem('snowee_sound') !== 'off';
 
-// --- Synthesized "cute puppy bark" via Web Audio API ---
-// Generated in-browser (no external mp3), so it works even with zero internet,
-// which matters since LAN mode is designed to run offline.
 let _actx = null;
 function getAudioCtx(){
   if(!_actx) _actx = new (window.AudioContext || window.webkitAudioContext)();
   if(_actx.state === 'suspended') _actx.resume();
   return _actx;
 }
-// Unlock audio on first tap anywhere (mobile browsers block audio.play()/oscillators
-// until a real user gesture has occurred at least once in the session).
 document.addEventListener('click', function unlock(){
   try{ getAudioCtx(); }catch(e){}
   document.removeEventListener('click', unlock);
@@ -703,7 +708,6 @@ function _tone(ctx, t, dur, freq, peakGain, type){
   osc.start(t); osc.stop(t + dur + 0.02);
 }
 function _coinOnce(ctx, t0){
-  // Retro 8-bit "coin collect" — quick rising blip then a bright held note.
   _slideTone(ctx, t0, 0.08, 988, 1319, 0.28, 'square');
   _tone(ctx, t0 + 0.09, 0.45, 1568, 0.24, 'square');
 }
@@ -721,7 +725,7 @@ function toggleSound(){
   localStorage.setItem('snowee_sound', _soundOn ? 'on' : 'off');
   updateSoundBtn();
   if(_soundOn){
-    playBark(1); // little confirmation coin-sound so you know it's on
+    playBark(1);
     if(window.Notification && Notification.permission === 'default') Notification.requestPermission();
   }
 }
@@ -783,23 +787,14 @@ loadData();
   });
 
   function attachLiveListener(){
-    // Use LOCAL date (matches the rest of the dashboard's today()/localISO logic),
-    // not UTC, so this lines up correctly with selectedDate / r.date comparisons.
     const now = new Date();
     const todayLocal = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
-    // Query from local midnight, expressed as the matching UTC instant.
     const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
     const ordersRef = query(ref(fbDb,'orders/v4'), orderByChild('timeCreated'), startAt(localMidnight.toISOString()));
 
-    // Re-applies the most recent live snapshot on top of rawRows. Exposed on
-    // window so loadData()/the periodic JSON refresh (defined in the other
-    // <script> block, which overwrites rawRows wholesale) can call it right
-    // after, since the JSON file lags behind Firebase by several minutes and
-    // would otherwise silently erase today's just-placed orders.
     window._applyLiveRows = function(){
       if(!window._liveRowsCache) return;
       const { todayLocal: tl, liveRows } = window._liveRowsCache;
-      // Guard: only replace if we have live rows — don't wipe Sheet data with an empty array.
       if(liveRows.length > 0){
         rawRows = rawRows.filter(r => r.date !== tl).concat(liveRows);
       }
@@ -808,14 +803,8 @@ loadData();
     onValue(ordersRef, snap=>{
       const val = snap.val() || {};
       let orders = Object.values(val).filter(o => !o.voided);
-      // Defensive: keep only orders whose own date/timeCreated is today (covers any tz edge case)
       orders = orders.filter(o => (o.date||'').slice(0,10) === todayLocal || (o.timeCreated||'').slice(0,10) === todayLocal);
 
-      // --- New-order sound detection ---
-      // onValue fires with the FULL snapshot every time, so we diff against the
-      // last-seen set of txnIds to know which orders are actually new (rather than
-      // re-triggering on every re-render). The very first snapshot after page load
-      // just seeds the set — it should not bark for orders that already existed.
       const currentTxnIds = new Set(orders.map(o=>o.txnId).filter(Boolean));
       if(window._seenTxnIds === undefined){
         window._seenTxnIds = currentTxnIds;
@@ -830,11 +819,6 @@ loadData();
         window._seenTxnIds = currentTxnIds;
       }
 
-      // Flatten each order into one row per item — matching the exact shape
-      // rawRows already uses (date, item, category, qty, subtotal, order_total,
-      // payment, queue, customer, txnId, timeCreated) — so all existing render
-      // functions (buildDayCard, hourBarChart, categoryBreakdown, rankList,
-      // orderLog, etc.) work unmodified on this live data.
       const liveRows = [];
       orders.forEach(o=>{
         const payment = o.payMethod === 'gcash' ? 'GCash' : 'Cash';
@@ -861,11 +845,8 @@ loadData();
         });
       });
 
-      // Cache this snapshot so JSON-based refreshes can re-apply it afterward.
       window._liveRowsCache = { todayLocal, liveRows };
 
-      // Replace any stale rows for today (from the periodic JSON) with these live ones.
-      // Guard: only replace if we actually got live rows — don't wipe Sheet data with an empty array.
       if(liveRows.length > 0){
         rawRows = rawRows.filter(r => r.date !== todayLocal).concat(liveRows);
       }
@@ -873,7 +854,6 @@ loadData();
       const timeEl = document.getElementById('topnav-live-time');
       if(timeEl) timeEl.textContent = 'Updated ' + new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 
-      // Re-render whatever's currently on screen if it depends on today's data.
       if(typeof currentTab !== 'undefined'){
         if(currentTab==='today' && typeof selectedDate!=='undefined' && selectedDate===todayLocal && typeof renderToday==='function'){
           renderToday();
