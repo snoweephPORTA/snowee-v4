@@ -163,6 +163,20 @@ html,body{height:100%;font-family:'Nunito',sans-serif;background:var(--off);colo
 @keyframes spin{to{transform:rotate(360deg);}}
 .toast{position:fixed;top:62px;left:50%;transform:translateX(-50%);background:var(--navy);color:var(--yellow);font-weight:900;font-size:12px;padding:8px 16px;border-radius:20px;box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;pointer-events:none;transition:opacity .2s;z-index:500;white-space:nowrap;border:2px solid var(--yellow);}
 .toast.show{opacity:1;}
+.summary-strip{display:flex;gap:6px;padding:8px 10px 0;flex-shrink:0;background:var(--off);}
+.strip-tile{flex:1;background:var(--white);border:2px solid var(--light);border-radius:10px;padding:7px 6px;text-align:center;cursor:pointer;transition:border-color .15s;}
+.strip-tile:active{border-color:var(--yellow);}
+.strip-tile-num{font-family:'Black Han Sans',sans-serif;font-size:13px;color:var(--dark);line-height:1.1;}
+.strip-tile-lbl{font-size:8px;font-weight:800;color:var(--gray);text-transform:uppercase;margin-top:2px;}
+.hist-subtab-bar{display:flex;gap:4px;padding:0 0 8px;}
+.hist-stab{flex:1;background:var(--white);border:2px solid var(--light);border-radius:8px;font-family:'Black Han Sans',sans-serif;font-size:9px;color:var(--gray);padding:6px 2px;cursor:pointer;text-align:center;}
+.hist-stab.active{background:var(--navy);border-color:var(--navy);color:var(--yellow);}
+.hist-summary-item{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid var(--light);gap:10px;}
+.hist-summary-item:last-child{border-bottom:none;}
+.hist-summary-label{font-family:'Black Han Sans',sans-serif;font-size:13px;color:var(--dark);min-width:90px;}
+.hist-summary-right{text-align:right;flex:1;}
+.hist-summary-rev{font-family:'Black Han Sans',sans-serif;font-size:15px;color:var(--dark);}
+.hist-summary-sub{font-size:10px;font-weight:700;color:var(--gray);}
 </style>
 </head>
 <body>
@@ -187,6 +201,20 @@ html,body{height:100%;font-family:'Nunito',sans-serif;background:var(--off);colo
     <button class="tabbtn" onclick="switchTab('history')">📋 History</button>
     <button class="tabbtn" onclick="switchTab('insights')">💡 Insights</button>
     <button class="tabbtn" onclick="switchTab('alerts')">🚨 Alerts</button>
+  </div>
+  <div class="summary-strip" id="summary-strip">
+    <div class="strip-tile" onclick="switchTab('today')">
+      <div class="strip-tile-num" id="strip-today">—</div>
+      <div class="strip-tile-lbl">Today</div>
+    </div>
+    <div class="strip-tile" onclick="switchTab('weekly')">
+      <div class="strip-tile-num" id="strip-week">—</div>
+      <div class="strip-tile-lbl">This Week</div>
+    </div>
+    <div class="strip-tile" onclick="switchTab('monthly')">
+      <div class="strip-tile-num" id="strip-month">—</div>
+      <div class="strip-tile-lbl">This Month</div>
+    </div>
   </div>
   <div class="content">
     <div class="tab-panel active" id="tab-today">
@@ -213,6 +241,12 @@ html,body{height:100%;font-family:'Nunito',sans-serif;background:var(--off);colo
       <div id="items-body"><div class="loading"><div class="spinner"></div>Loading...</div></div>
     </div>
     <div class="tab-panel" id="tab-history">
+      <div class="hist-subtab-bar">
+        <button class="hist-stab active" onclick="setHistTab('daily')">📋 Daily</button>
+        <button class="hist-stab" onclick="setHistTab('weekly')">📅 Weekly</button>
+        <button class="hist-stab" onclick="setHistTab('monthly')">📆 Monthly</button>
+        <button class="hist-stab" onclick="setHistTab('yearly')">🗓️ Yearly</button>
+      </div>
       <div id="history-body"><div class="loading"><div class="spinner"></div>Loading...</div></div>
     </div>
     <div class="tab-panel" id="tab-insights">
@@ -243,6 +277,11 @@ function fixDate(d){
   } catch(e) {}
   return s;
 }
+// time/timeCreated/timeDone columns come back anchored to the Sheets time-epoch
+// (e.g. "Sat Dec 30 1899 16:35:00 GMT+0800") because those Sheet columns are
+// formatted as TIME-only. The hour/minute portion still parses correctly —
+// only the *date* portion is bogus, so never use this for day-bucketing.
+// Always use row.date (a clean "YYYY-MM-DD" string) for that instead.
 function getHourFromRow(r){
   if(r.timeCreated){const d=new Date(r.timeCreated);if(!isNaN(d.getTime()))return d.getHours();}
   if(r.time){const d=new Date(r.time);if(!isNaN(d.getTime()))return d.getHours();}
@@ -259,6 +298,11 @@ let selectedDate=today();
 let currentTab='today';
 let itemFilter='today';
 
+/* ── TXN-ID reconciliation (locked-in rule) ──
+   Group every row by txnId. Old test rows (before TXN IDs existed) fall back
+   to date|queue so they don't collapse into one phantom order. order_total is
+   the single source of truth for an order's value — it's written identically
+   on every row of that order by the POS, matching what the POS itself shows. */
 function orderKey(r){
   const txn=String(r.txnId||'').trim();
   if(txn) return txn;
@@ -274,18 +318,10 @@ function getOrders(rows){
   });
   return Object.values(o);
 }
-// Uses the all-time lightweight summaries pushed from Apps Script (covers every
-// day since the beginning), falling back to computing from rawRows for any date
-// not covered by the JSON — e.g. today, which arrives live via Firebase before
-// the next scheduled JSON push includes it. This keeps History's all-time totals
-// intact even though rawRows itself only carries the last 30 days of detail.
 function dailySummary(){
-  const fromJson=(window._dailySummariesCache||[]).map(s=>({date:s.date,revenue:s.revenue,orders:s.orders,cash:s.cash,gcash:s.gcash}));
-  const jsonDates={};fromJson.forEach(s=>{jsonDates[s.date]=true;});
-
   const byDate={};
   rawRows.forEach(function(r){
-    const d=r.date; if(!d||jsonDates[d]) return;
+    const d=r.date; if(!d) return;
     if(!byDate[d]) byDate[d]={date:d,revenue:0,orders:0,cash:0,gcash:0,_seen:{}};
     const key=orderKey(r);
     if(!byDate[d]._seen[key]){
@@ -295,7 +331,7 @@ function dailySummary(){
       if((r.payment||'').toLowerCase()==='gcash') byDate[d].gcash+=tot; else byDate[d].cash+=tot;
     }
   });
-  return fromJson.concat(Object.values(byDate));
+  return Object.values(byDate);
 }
 function getItemsFromRows(rows,limit=20){
   const m={};
@@ -417,18 +453,7 @@ function orderLog(rows){
   }).join('')+'</div>';
 }
 function buildDayCard(rows,dateStr){
-  if(!rows.length){
-    // Check if we have at least a summary total for this day (from the all-time
-    // dailySummaries JSON) even though no itemized rawRows exist for it (older
-    // than the 30-day detail window). Show the total with a note instead of
-    // claiming there's no data at all.
-    const DS=dailySummary();
-    const s=DS.find(d=>d.date===dateStr);
-    if(s){
-      return`<div class="card"><div class="big-stat"><div class="big-num">₱${fmt(s.revenue.toFixed(0))}</div><div class="big-lbl">Total Revenue</div></div><div class="stat-grid"><div class="stat-item"><div class="stat-num">${s.orders}</div><div class="stat-lbl">Orders</div></div><div class="stat-item"><div class="stat-num">₱${fmt((s.orders?s.revenue/s.orders:0).toFixed(0))}</div><div class="stat-lbl">Avg Order</div></div></div><div class="pay-row"><div class="pay-item"><div class="pay-num">₱${fmt(s.cash.toFixed(0))}</div><div class="pay-lbl">💵 Cash</div></div><div class="pay-item"><div class="pay-num" style="color:#007AFF">₱${fmt(s.gcash.toFixed(0))}</div><div class="pay-lbl">📱 GCash</div></div></div></div><div class="empty">📁 Detailed order log is only kept for the last 30 days.<br>This day's totals are shown above from the all-time summary.</div>`;
-    }
-    return`<div class="empty">📭 No orders for ${fmtDateLabel(dateStr)}</div>`;
-  }
+  if(!rows.length)return`<div class="empty">📭 No orders for ${fmtDateLabel(dateStr)}</div>`;
   const orders=getOrders(rows);
   const rev=orders.reduce((s,o)=>s+o.total,0);
   const cashO=orders.filter(o=>(o.payment||'').toLowerCase()==='cash');
@@ -499,26 +524,200 @@ function renderItems(){
   else{html=`<div class="card"><div class="card-hd"><span class="card-title">🗂️ By Category — All Time</span></div>${categoryBreakdown(rawRows)}</div><div class="card"><div class="card-hd"><span class="card-title">🥧 Category Share — All Time</span></div>${pieSVG(rawRows)}</div><div class="card"><div class="card-hd"><span class="card-title">🏆 Top Items — All Time</span></div>${rankList(getItemsFromRows(rawRows,30))}</div>`;}
   document.getElementById('items-body').innerHTML=html;
 }
+let histTab = 'daily';
+function setHistTab(t){
+  histTab = t;
+  document.querySelectorAll('.hist-stab').forEach(b=>b.classList.remove('active'));
+  const idx = ['daily','weekly','monthly','yearly'].indexOf(t);
+  const btns = document.querySelectorAll('.hist-stab');
+  if(btns[idx]) btns[idx].classList.add('active');
+  renderHistory();
+}
+
+// Returns Monday of the week containing date string d
+function weekStart(d){
+  const dt = new Date(d+'T00:00:00');
+  const day = dt.getDay(); // 0=Sun
+  const diff = (day === 0) ? -6 : 1 - day; // shift to Monday
+  dt.setDate(dt.getDate() + diff);
+  return localISO(dt);
+}
+function weekEnd(monStr){
+  const dt = new Date(monStr+'T00:00:00');
+  dt.setDate(dt.getDate() + 6);
+  return localISO(dt);
+}
+function fmtWeekLabel(monStr){
+  const end = weekEnd(monStr);
+  const s = new Date(monStr+'T00:00:00');
+  const e = new Date(end+'T00:00:00');
+  const mo = (d)=>d.toLocaleDateString([],{month:'short'});
+  const da = (d)=>d.getDate();
+  if(s.getMonth()===e.getMonth()) return `${mo(s)} ${da(s)}–${da(e)}`;
+  return `${mo(s)} ${da(s)} – ${mo(e)} ${da(e)}`;
+}
+
 function renderHistory(){
-  const DS=dailySummary();
-  if(!DS.length){document.getElementById('history-body').innerHTML='<div class="empty">No history yet</div>';return;}
-  const sorted=[...DS].sort((a,b)=>b.date.localeCompare(a.date));
-  const allRev=DS.reduce((s,d)=>s+d.revenue,0);
-  const allOrders=DS.reduce((s,d)=>s+d.orders,0);
-  const allDays=DS.length;
-  const days30=getDays(30);
-  const recentRevs=days30.map(d=>{const ds=DS.find(s=>s.date===d);return ds?ds.revenue:0;});
-  const firstHalf=recentRevs.slice(0,15).reduce((s,v)=>s+v,0)/15;
-  const secondHalf=recentRevs.slice(15).reduce((s,v)=>s+v,0)/15;
-  const trendPct=firstHalf>0?((secondHalf-firstHalf)/firstHalf*100):0;
-  const trendDir=trendPct>5?'📈 Growing':trendPct<-5?'📉 Declining':'➡️ Stable';
-  const trendColor=trendPct>5?'var(--green)':trendPct<-5?'var(--red)':'var(--gray)';
-  document.getElementById('history-body').innerHTML=`
-    <div class="card"><div class="card-hd"><span class="card-title">📈 All-Time Summary</span></div>
-    <div class="stat-grid"><div class="stat-item"><div class="stat-num">${fmtK(allRev)}</div><div class="stat-lbl">Total Revenue</div></div><div class="stat-item"><div class="stat-num">${allOrders}</div><div class="stat-lbl">Total Orders</div></div><div class="stat-item"><div class="stat-num">${fmtK(allDays?allRev/allDays:0)}</div><div class="stat-lbl">Daily Avg</div></div><div class="stat-item"><div class="stat-num">${allDays}</div><div class="stat-lbl">Days Open</div></div></div></div>
-    <div class="card"><div class="card-hd"><span class="card-title">📈 30-Day Trend</span></div>${trendLine(days30)}<div class="card-body"><div style="font-family:'Black Han Sans',sans-serif;font-size:16px;color:${trendColor};margin-bottom:6px;">${trendDir}</div><div style="font-size:11px;font-weight:700;color:var(--gray);">First 15 days avg: ${fmtK(firstHalf)} · Last 15 days avg: <span style="color:${trendColor}">${fmtK(secondHalf)}</span></div></div></div>
-    <div class="card"><div class="card-hd"><span class="card-title">📅 Day of Week Pattern</span></div>${dowHeatmap()}</div>
-    <div class="card"><div class="card-hd"><span class="card-title">📋 Sales History</span><span class="card-sub">${allDays} days</span></div><div class="rank-list">${sorted.map(d=>`<div class="history-item" onclick="switchTab('today');selectedDate='${d.date}';document.getElementById('date-picker').value='${d.date}';renderToday();"><div><div class="hist-date">${fmtDateLabel(d.date)}</div><div class="hist-sub">${d.orders} orders · 💵₱${fmt(d.cash)} 📱₱${fmt(d.gcash)}</div></div><div style="text-align:right;flex:1;"><div class="hist-rev">₱${fmt(d.revenue.toFixed(0))}</div></div></div>`).join('')}</div></div>`;
+  const DS = dailySummary();
+  const el = document.getElementById('history-body');
+  if(!DS.length){ el.innerHTML='<div class="empty">No history yet</div>'; return; }
+
+  const allRev = DS.reduce((s,d)=>s+d.revenue,0);
+  const allOrders = DS.reduce((s,d)=>s+d.orders,0);
+  const allDays = DS.length;
+  const summaryCard = `<div class="card"><div class="card-hd"><span class="card-title">📈 All-Time Summary</span></div>
+    <div class="stat-grid">
+      <div class="stat-item"><div class="stat-num">${fmtK(allRev)}</div><div class="stat-lbl">Total Revenue</div></div>
+      <div class="stat-item"><div class="stat-num">${allOrders}</div><div class="stat-lbl">Total Orders</div></div>
+      <div class="stat-item"><div class="stat-num">${fmtK(allDays?allRev/allDays:0)}</div><div class="stat-lbl">Daily Avg</div></div>
+      <div class="stat-item"><div class="stat-num">${allDays}</div><div class="stat-lbl">Days Open</div></div>
+    </div></div>`;
+
+  if(histTab === 'daily'){
+    const sorted=[...DS].sort((a,b)=>b.date.localeCompare(a.date));
+    const days30=getDays(30);
+    const recentRevs=days30.map(d=>{const ds=DS.find(s=>s.date===d);return ds?ds.revenue:0;});
+    const firstHalf=recentRevs.slice(0,15).reduce((s,v)=>s+v,0)/15;
+    const secondHalf=recentRevs.slice(15).reduce((s,v)=>s+v,0)/15;
+    const trendPct=firstHalf>0?((secondHalf-firstHalf)/firstHalf*100):0;
+    const trendDir=trendPct>5?'📈 Growing':trendPct<-5?'📉 Declining':'➡️ Stable';
+    const trendColor=trendPct>5?'var(--green)':trendPct<-5?'var(--red)':'var(--gray)';
+    el.innerHTML = summaryCard +
+      `<div class="card"><div class="card-hd"><span class="card-title">📈 30-Day Trend</span></div>${trendLine(days30)}<div class="card-body"><div style="font-family:'Black Han Sans',sans-serif;font-size:16px;color:${trendColor};margin-bottom:6px;">${trendDir}</div><div style="font-size:11px;font-weight:700;color:var(--gray);">First 15d avg: ${fmtK(firstHalf)} · Last 15d avg: <span style="color:${trendColor}">${fmtK(secondHalf)}</span></div></div></div>
+      <div class="card"><div class="card-hd"><span class="card-title">📅 Day of Week Pattern</span></div>${dowHeatmap()}</div>
+      <div class="card"><div class="card-hd"><span class="card-title">📋 Daily Sales</span><span class="card-sub">${allDays} days</span></div><div class="rank-list">${sorted.map(d=>`<div class="history-item" onclick="switchTab('today');selectedDate='${d.date}';document.getElementById('date-picker').value='${d.date}';renderToday();"><div><div class="hist-date">${fmtDateLabel(d.date)}</div><div class="hist-sub">${d.orders} orders · 💵₱${fmt(d.cash)} 📱₱${fmt(d.gcash)}</div></div><div style="text-align:right;flex:1;"><div class="hist-rev">₱${fmt(d.revenue.toFixed(0))}</div></div></div>`).join('')}</div></div>`;
+    return;
+  }
+
+  if(histTab === 'weekly'){
+    // Group DS by Mon-start week key
+    const weeks = {};
+    DS.forEach(d=>{
+      const wk = weekStart(d.date);
+      if(!weeks[wk]) weeks[wk]={weekStart:wk,revenue:0,orders:0,cash:0,gcash:0,days:0};
+      weeks[wk].revenue += d.revenue;
+      weeks[wk].orders  += d.orders;
+      weeks[wk].cash    += (d.cash||0);
+      weeks[wk].gcash   += (d.gcash||0);
+      weeks[wk].days++;
+    });
+    const sorted = Object.values(weeks).sort((a,b)=>b.weekStart.localeCompare(a.weekStart));
+    const maxRev = Math.max(...sorted.map(w=>w.revenue),1);
+    el.innerHTML = summaryCard +
+      `<div class="card"><div class="card-hd"><span class="card-title">📅 Weekly Sales</span><span class="card-sub">${sorted.length} weeks</span></div>
+      <div class="rank-list">${sorted.map((w,i)=>{
+        const barW = (w.revenue/maxRev*100).toFixed(0);
+        const isCurrentWk = weekStart(today()) === w.weekStart;
+        return `<div class="hist-summary-item">
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <div class="hist-summary-label">${fmtWeekLabel(w.weekStart)}</div>
+              ${isCurrentWk?'<span style="font-size:8px;font-weight:900;background:var(--yellow);color:var(--navy);border-radius:4px;padding:1px 5px;">NOW</span>':''}
+            </div>
+            <div style="background:var(--light);border-radius:3px;height:3px;margin-top:4px;"><div style="width:${barW}%;height:3px;border-radius:3px;background:var(--yellow-dark);"></div></div>
+            <div class="hist-summary-sub" style="margin-top:3px;">${w.orders} orders · ${w.days} days open · 💵₱${fmt(w.cash)} 📱₱${fmt(w.gcash)}</div>
+          </div>
+          <div class="hist-summary-right"><div class="hist-summary-rev">₱${fmt(w.revenue.toFixed(0))}</div></div>
+        </div>`;
+      }).join('')}</div></div>`;
+    return;
+  }
+
+  if(histTab === 'monthly'){
+    const months = {};
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    DS.forEach(d=>{
+      const mk = d.date.substring(0,7); // "2026-07"
+      if(!months[mk]) months[mk]={key:mk,revenue:0,orders:0,cash:0,gcash:0,days:0};
+      months[mk].revenue += d.revenue;
+      months[mk].orders  += d.orders;
+      months[mk].cash    += (d.cash||0);
+      months[mk].gcash   += (d.gcash||0);
+      months[mk].days++;
+    });
+    const sorted = Object.values(months).sort((a,b)=>b.key.localeCompare(a.key));
+    const maxRev = Math.max(...sorted.map(m=>m.revenue),1);
+    const currentMk = today().substring(0,7);
+    el.innerHTML = summaryCard +
+      `<div class="card"><div class="card-hd"><span class="card-title">📆 Monthly Sales</span><span class="card-sub">${sorted.length} months</span></div>
+      <div class="rank-list">${sorted.map(m=>{
+        const [yr,mo] = m.key.split('-');
+        const label = `${MONTH_NAMES[parseInt(mo)-1]} ${yr}`;
+        const barW = (m.revenue/maxRev*100).toFixed(0);
+        const isCurrent = m.key === currentMk;
+        return `<div class="hist-summary-item">
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <div class="hist-summary-label">${label}</div>
+              ${isCurrent?'<span style="font-size:8px;font-weight:900;background:var(--yellow);color:var(--navy);border-radius:4px;padding:1px 5px;">NOW</span>':''}
+            </div>
+            <div style="background:var(--light);border-radius:3px;height:3px;margin-top:4px;"><div style="width:${barW}%;height:3px;border-radius:3px;background:var(--yellow-dark);"></div></div>
+            <div class="hist-summary-sub" style="margin-top:3px;">${m.orders} orders · ${m.days} days open · 💵₱${fmt(m.cash)} 📱₱${fmt(m.gcash)}</div>
+          </div>
+          <div class="hist-summary-right"><div class="hist-summary-rev">₱${fmt(m.revenue.toFixed(0))}</div></div>
+        </div>`;
+      }).join('')}</div></div>`;
+    return;
+  }
+
+  if(histTab === 'yearly'){
+    const years = {};
+    DS.forEach(d=>{
+      const yr = d.date.substring(0,4);
+      if(!years[yr]) years[yr]={year:yr,revenue:0,orders:0,cash:0,gcash:0,days:0};
+      years[yr].revenue += d.revenue;
+      years[yr].orders  += d.orders;
+      years[yr].cash    += (d.cash||0);
+      years[yr].gcash   += (d.gcash||0);
+      years[yr].days++;
+    });
+    const sorted = Object.values(years).sort((a,b)=>b.year.localeCompare(a.year));
+    const maxRev = Math.max(...sorted.map(y=>y.revenue),1);
+    const currentYr = today().substring(0,4);
+    el.innerHTML = summaryCard +
+      `<div class="card"><div class="card-hd"><span class="card-title">🗓️ Yearly Sales</span><span class="card-sub">${sorted.length} year${sorted.length>1?'s':''}</span></div>
+      <div class="rank-list">${sorted.map(y=>{
+        const barW = (y.revenue/maxRev*100).toFixed(0);
+        const isCurrent = y.year === currentYr;
+        return `<div class="hist-summary-item">
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <div class="hist-summary-label" style="font-size:16px;">${y.year}</div>
+              ${isCurrent?'<span style="font-size:8px;font-weight:900;background:var(--yellow);color:var(--navy);border-radius:4px;padding:1px 5px;">NOW</span>':''}
+            </div>
+            <div style="background:var(--light);border-radius:3px;height:4px;margin-top:4px;"><div style="width:${barW}%;height:4px;border-radius:3px;background:var(--navy);"></div></div>
+            <div class="hist-summary-sub" style="margin-top:3px;">${y.orders} orders · ${y.days} days open · 💵₱${fmt(y.cash)} 📱₱${fmt(y.gcash)}</div>
+          </div>
+          <div class="hist-summary-right"><div class="hist-summary-rev" style="font-size:18px;">₱${fmt(y.revenue.toFixed(0))}</div></div>
+        </div>`;
+      }).join('')}</div></div>`;
+    return;
+  }
+}
+
+function updateSummaryStrip(){
+  const DS = dailySummary();
+  const todayStr = today();
+
+  // Today
+  const todayDS = DS.find(d=>d.date===todayStr);
+  const todayRev = todayDS ? todayDS.revenue : 0;
+
+  // This calendar week (Mon–Sun)
+  const wkStart = weekStart(todayStr);
+  const wkEnd = weekEnd(wkStart);
+  const weekRev = DS.filter(d=>d.date>=wkStart&&d.date<=wkEnd).reduce((s,d)=>s+d.revenue,0);
+
+  // This calendar month
+  const monthKey = todayStr.substring(0,7);
+  const monthRev = DS.filter(d=>d.date.substring(0,7)===monthKey).reduce((s,d)=>s+d.revenue,0);
+
+  const el1 = document.getElementById('strip-today');
+  const el2 = document.getElementById('strip-week');
+  const el3 = document.getElementById('strip-month');
+  if(el1) el1.textContent = fmtK(todayRev);
+  if(el2) el2.textContent = fmtK(weekRev);
+  if(el3) el3.textContent = fmtK(monthRev);
 }
 function renderInsights(){
   const DS=dailySummary();
@@ -553,6 +752,7 @@ function renderInsights(){
   document.getElementById('insights-body').innerHTML=`<div class="card"><div class="card-hd"><span class="card-title">💡 Business Insights</span><span class="card-sub">Auto-generated</span></div><div>${insights.map(ins=>`<div class="insight-item"><div class="insight-icon">${ins.icon}</div><div class="insight-text"><div class="insight-title">${ins.title}</div><div class="insight-desc">${ins.desc}</div><span class="insight-badge ${ins.badge}">${ins.badgeText}</span></div></div>`).join('')}</div></div>`;
 }
 
+/* ── Floating Order Alerts (3-min / 5-min, from POS popups) ── */
 window._floatingAlerts = [];
 async function pollFloatingAlerts(){
   try{
@@ -652,6 +852,7 @@ async function loadData(){
       document.getElementById('last-update').textContent='Updated '+new Date(json.updated).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
       document.getElementById('date-picker').value=selectedDate;
       renderCurrentTab();
+      updateSummaryStrip();
       toast('✅ Loaded!');
     }else throw new Error(json.message||'Error');
   }catch(e){toast('❌ '+e.message);console.error(e);}
@@ -667,77 +868,19 @@ setInterval(async function(){
       document.getElementById('last-update').textContent='Updated '+new Date(json.updated).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
       if(currentTab!=='today')renderCurrentTab();
       else renderToday();
+      updateSummaryStrip();
     }
   }catch(e){}
 },300000);
 
-let _soundOn = localStorage.getItem('snowee_sound') !== 'off';
-
-let _actx = null;
-function getAudioCtx(){
-  if(!_actx) _actx = new (window.AudioContext || window.webkitAudioContext)();
-  if(_actx.state === 'suspended') _actx.resume();
-  return _actx;
-}
-document.addEventListener('click', function unlock(){
-  try{ getAudioCtx(); }catch(e){}
-  document.removeEventListener('click', unlock);
-}, { once:true });
-
-function _slideTone(ctx, t, dur, freqStart, freqEnd, peakGain, type){
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = type || 'square';
-  osc.frequency.setValueAtTime(freqStart, t);
-  osc.frequency.exponentialRampToValueAtTime(freqEnd, t + dur);
-  gain.gain.setValueAtTime(0.0001, t);
-  gain.gain.exponentialRampToValueAtTime(peakGain, t + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  osc.connect(gain); gain.connect(ctx.destination);
-  osc.start(t); osc.stop(t + dur + 0.02);
-}
-function _tone(ctx, t, dur, freq, peakGain, type){
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = type || 'square';
-  osc.frequency.setValueAtTime(freq, t);
-  gain.gain.setValueAtTime(0.0001, t);
-  gain.gain.exponentialRampToValueAtTime(peakGain, t + 0.015);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  osc.connect(gain); gain.connect(ctx.destination);
-  osc.start(t); osc.stop(t + dur + 0.02);
-}
-function _coinOnce(ctx, t0){
-  _slideTone(ctx, t0, 0.08, 988, 1319, 0.28, 'square');
-  _tone(ctx, t0 + 0.09, 0.45, 1568, 0.24, 'square');
-}
-function playBark(times){
-  if(!_soundOn) return;
-  times = Math.max(1, Math.min(times||1, 3));
-  try{
-    const ctx = getAudioCtx();
-    for(let i=0;i<times;i++) _coinOnce(ctx, ctx.currentTime + i*0.65);
-  }catch(e){}
-}
-
-function toggleSound(){
-  _soundOn = !_soundOn;
-  localStorage.setItem('snowee_sound', _soundOn ? 'on' : 'off');
-  updateSoundBtn();
-  if(_soundOn){
-    playBark(1);
-    if(window.Notification && Notification.permission === 'default') Notification.requestPermission();
-  }
-}
+let _soundOn=true;
+function toggleSound(){_soundOn=!_soundOn;updateSoundBtn();}
 function updateSoundBtn(){const b=document.getElementById('sound-btn');b.textContent=_soundOn?'🔔':'🔕';b.classList.toggle('off',!_soundOn);}
 
 let toastT;
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove('show'),2400);}
 
 document.getElementById('date-picker').value=selectedDate;
-document.addEventListener('visibilitychange', () => {
-  if(!document.hidden && _actx && _actx.state === 'suspended') _actx.resume().catch(()=>{});
-});
 updateSoundBtn();
 loadData();
 </script>
@@ -787,14 +930,23 @@ loadData();
   });
 
   function attachLiveListener(){
+    // Use LOCAL date (matches the rest of the dashboard's today()/localISO logic),
+    // not UTC, so this lines up correctly with selectedDate / r.date comparisons.
     const now = new Date();
     const todayLocal = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+    // Query from local midnight, expressed as the matching UTC instant.
     const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
     const ordersRef = query(ref(fbDb,'orders/v4'), orderByChild('timeCreated'), startAt(localMidnight.toISOString()));
 
+    // Re-applies the most recent live snapshot on top of rawRows. Exposed on
+    // window so loadData()/the periodic JSON refresh (defined in the other
+    // <script> block, which overwrites rawRows wholesale) can call it right
+    // after, since the JSON file lags behind Firebase by several minutes and
+    // would otherwise silently erase today's just-placed orders.
     window._applyLiveRows = function(){
       if(!window._liveRowsCache) return;
       const { todayLocal: tl, liveRows } = window._liveRowsCache;
+      // Guard: only replace if we have live rows — don't wipe Sheet data with empty array.
       if(liveRows.length > 0){
         rawRows = rawRows.filter(r => r.date !== tl).concat(liveRows);
       }
@@ -803,22 +955,14 @@ loadData();
     onValue(ordersRef, snap=>{
       const val = snap.val() || {};
       let orders = Object.values(val).filter(o => !o.voided);
+      // Defensive: keep only orders whose own date/timeCreated is today (covers any tz edge case)
       orders = orders.filter(o => (o.date||'').slice(0,10) === todayLocal || (o.timeCreated||'').slice(0,10) === todayLocal);
 
-      const currentTxnIds = new Set(orders.map(o=>o.txnId).filter(Boolean));
-      if(window._seenTxnIds === undefined){
-        window._seenTxnIds = currentTxnIds;
-      } else {
-        const newTxnIds = [...currentTxnIds].filter(id => !window._seenTxnIds.has(id));
-        if(newTxnIds.length > 0){
-          playBark(newTxnIds.length);
-          if(document.hidden && window.Notification && Notification.permission === 'granted'){
-            try{ new Notification('🐶 New order!', { body: newTxnIds.length===1 ? 'A new order came in.' : newTxnIds.length+' new orders came in.' }); }catch(e){}
-          }
-        }
-        window._seenTxnIds = currentTxnIds;
-      }
-
+      // Flatten each order into one row per item — matching the exact shape
+      // rawRows already uses (date, item, category, qty, subtotal, order_total,
+      // payment, queue, customer, txnId, timeCreated) — so all existing render
+      // functions (buildDayCard, hourBarChart, categoryBreakdown, rankList,
+      // orderLog, etc.) work unmodified on this live data.
       const liveRows = [];
       orders.forEach(o=>{
         const payment = o.payMethod === 'gcash' ? 'GCash' : 'Cash';
@@ -845,8 +989,10 @@ loadData();
         });
       });
 
+      // Cache this snapshot so JSON-based refreshes can re-apply it afterward.
       window._liveRowsCache = { todayLocal, liveRows };
 
+      // Guard: only replace today's rows if we got live data — don't wipe Sheet data with empty.
       if(liveRows.length > 0){
         rawRows = rawRows.filter(r => r.date !== todayLocal).concat(liveRows);
       }
@@ -854,6 +1000,10 @@ loadData();
       const timeEl = document.getElementById('topnav-live-time');
       if(timeEl) timeEl.textContent = 'Updated ' + new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 
+      // Update summary strip with latest live totals.
+      if(typeof updateSummaryStrip === 'function') updateSummaryStrip();
+
+      // Re-render whatever's currently on screen if it depends on today's data.
       if(typeof currentTab !== 'undefined'){
         if(currentTab==='today' && typeof selectedDate!=='undefined' && selectedDate===todayLocal && typeof renderToday==='function'){
           renderToday();
